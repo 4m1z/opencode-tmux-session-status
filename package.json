@@ -8,7 +8,12 @@
     "url": "https://github.com/4m1z/opencode-tmux-status"
   },
   "homepage": "https://github.com/4m1z/opencode-tmux-status#readme",
-  "keywords": ["opencode", "opencode-plugin", "tmux", "status"],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "tmux",
+    "status"
+  ],
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
@@ -23,13 +28,18 @@
   "scripts": {
     "build": "bun build ./src/index.ts --outdir ./dist --target bun",
     "prepack": "bun run build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "lint": "tsc --noEmit",
+    "format:check": "prettier --check src tests README.md package.json tsconfig.json"
   },
   "dependencies": {
     "@opencode/plugin": "latest"
   },
   "devDependencies": {
     "@types/node": "^26.6.3",
+    "bun-types": "^1.4.2",
+    "prettier": "^3.6.2",
     "typescript": "^5.9.0"
   }
 }

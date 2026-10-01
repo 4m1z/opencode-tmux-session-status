@@ -1,355 +1,202 @@
-// tmux-status — opencode V2 plugin reporting session status to tmux.
-//
-// The tmux-opencode-session-manager keeps one tmux session per project
-// directory on a dedicated tmux server socket (default "opencode-popup").
-// This plugin stamps that tmux session with @opencode_state /
-// @opencode_state_at / @opencode_detail so the picker and the persistent
-// status-line indicators can show whether each session is working / waiting /
-// done / error / idle without scraping pane contents.
-//
-// Why this exists (V2 note): plugins run inside the background opencode
-// service, NOT inside the tmux pane, so $TMUX/$TMUX_PANE are unavailable.
-// Instead we map the event's project directory to the tmux session name with
-// the same hash the launcher uses:  oc_<cksum-of-dir>.
-//
-// State model (shared with scripts/statusline.sh, scripts/reconcile.sh,
-// scripts/picker.sh, scripts/ack.sh):
-//   working  agent is actively running (animated spinner in tmux)
-//   waiting  needs input: permission request or open question (attention)
-//   done     turn finished, unacknowledged (stays until ack.sh runs on open)
-//   error    run failed / session errored (stays until next task starts)
-//   idle     no work outstanding, acknowledged (dim, distinct from done)
-// Never infer completion from silence: only explicit idle/error events (or
-// the reconcile daemon's outcome-based promotion) produce done/error.
-import { Plugin } from "@opencode/plugin"
-import { spawnSync } from "node:child_process"
+import { Plugin } from "@opencode/plugin";
+import type { Context } from "@opencode/plugin/promise/plugin";
+import { Adapter, clean } from "./process";
+import { decode, nonempty, type Decoded } from "./events";
+import { NotificationPolicy, StateMachine, type Transition } from "./state";
 
-type State = "working" | "waiting" | "done" | "error" | "idle"
+type SessionLookup = Pick<Context["session"], "get">;
 
-function optsOf(ctx: any): { socket: string; prefix: string } {
-  const o = (ctx?.options ?? {}) as Record<string, unknown>
-  return {
-    socket: typeof o.socket === "string" && o.socket ? o.socket : "opencode-popup",
-    prefix: typeof o.prefix === "string" && o.prefix ? o.prefix : "oc_",
+export async function resolveDirectory(
+  event: Decoded,
+  cache: Map<string, string>,
+  session: SessionLookup,
+  signal?: AbortSignal,
+): Promise<string | undefined> {
+  const explicit = nonempty(event.directory);
+  if (explicit) {
+    if (event.sessionID) cache.set(event.sessionID, explicit);
+    return explicit;
   }
-}
-
-// Same naming as scripts/helpers.sh session_hash():
-//   printf '%s' "$dir" | cksum | cut -d' ' -f1
-function tmuxSessionFor(prefix: string, dir: string): string | undefined {
+  if (!event.sessionID) return;
+  const cached = cache.get(event.sessionID);
+  if (cached) return cached;
   try {
-    const r = spawnSync("cksum", [], { input: dir, encoding: "utf-8", timeout: 2000 })
-    if (r.status !== 0) return undefined
-    const hash = String(r.stdout ?? "").trim().split(/\s+/)[0]
-    if (!hash) return undefined
-    return `${prefix}${hash}`
+    const info = await session.get({ sessionID: event.sessionID }, { signal });
+    const dir = nonempty(info.location.directory);
+    if (dir) cache.set(event.sessionID, dir);
+    return dir;
   } catch {
-    return undefined
+    return;
   }
 }
-
-function stamp(socket: string, session: string, state: State, detail: string): void {
-  const clean = String(detail ?? "").replace(/[\t\r\n]+/g, " ").slice(0, 80)
-  try {
-    spawnSync("tmux", ["-L", socket, "set-option", "-t", session, "@opencode_state", state], { timeout: 2000 })
-    spawnSync("tmux", ["-L", socket, "set-option", "-t", session, "@opencode_state_at", String(Math.floor(Date.now() / 1000))], { timeout: 2000 })
-    if (clean) {
-      spawnSync("tmux", ["-L", socket, "set-option", "-t", session, "@opencode_detail", clean], { timeout: 2000 })
-    }
-  } catch {
-    // tmux socket/session may not exist (yet) — picker falls back to the API.
-  }
-}
-
-// Dedupe for desktop notifications: one turn can emit several
-// completion-shaped events (session.idle + session.status idle +
-// legacy execution events), and several sessions can share one project
-// dir. Notify on transition into a terminal state; suppress repeats of
-// the same state within the cooldown. A changed detail (e.g. a new
-// permission request) re-notifies after a short floor.
-const lastNotifiedByDir = new Map<string, { state: State; detail: string; at: number }>()
-const lastStateByDir = new Map<string, State>()
-const NOTIFY_COOLDOWN_MS = 120_000
-const NOTIFY_SAME_STATE_DETAIL_MS = 15_000
-
-// Desktop notification for when the user may be on another workspace /
-// window and can't see tmux. Only for terminal states that need attention:
-// done / waiting / error — never for working (too noisy).
-function notify(state: State, dir: string, detail: string): void {
-  if (state !== "done" && state !== "waiting" && state !== "error") return
-  const now = Date.now()
-  const prevState = lastStateByDir.get(dir)
-  const last = lastNotifiedByDir.get(dir)
-  // A fresh transition (e.g. working -> done) always notifies, so quick
-  // back-to-back tasks each ping. Only repeats of the same stamped state
-  // (session.idle + session.status idle for one turn) are deduped.
-  if (last && last.state === state && prevState === state) {
-    const cleanDetail = String(detail ?? "").replace(/[\t\r\n]+/g, " ").slice(0, 120)
-    const sameDetail = String(last.detail ?? "") === cleanDetail
-    if (sameDetail && now - last.at < NOTIFY_COOLDOWN_MS) return
-    if (!sameDetail && now - last.at < NOTIFY_SAME_STATE_DETAIL_MS) return
-    if (now - last.at < NOTIFY_COOLDOWN_MS) return
-  }
-  const project = String(dir ?? "").replace(/\/+$/, "").split("/").pop() || dir || "opencode"
-  const clean = String(detail ?? "").replace(/[\t\r\n]+/g, " ").slice(0, 120) || state
-  const title =
-    state === "waiting"
-      ? `opencode: input needed (${project})`
-      : state === "error"
-        ? `opencode: run failed (${project})`
-        : `opencode: done (${project})`
-  const urgency = state === "done" ? "normal" : "critical"
-  const args = ["notification", "send", "--app-name", "opencode", "-u", urgency, title, clean]
-  try {
-    const r = spawnSync("omarchy", args, { timeout: 3000 })
-    lastNotifiedByDir.set(dir, { state, detail: clean, at: Date.now() })
-    if (r.status === 0) return
-    // Fallback for systems where the omarchy wrapper is unavailable.
-    spawnSync("notify-send", ["-a", "opencode", "-u", urgency, title, clean], { timeout: 3000 })
-  } catch {
-    // notifications must never break status stamping
-  }
-}
-
-// Normalize the many envelope shapes opencode V2 can deliver:
-//   - legacy/V1-style:          { type, data/sessionID/... }
-//   - V2 global event:          { directory, payload: { type, properties } }
-//   - V2 direct event:          { type, properties: { sessionID, ... } }
-// Returns { type, props, sessionID, directory } with best-effort extraction.
-function normalize(event: any): { type: string; props: any; sessionID?: string; directory?: string } {
-  const e = event ?? {}
-  if (e.payload && typeof e.payload.type === "string") {
-    const props = e.payload.properties ?? e.payload.data ?? {}
-    return {
-      type: e.payload.type,
-      props,
-      sessionID: props.sessionID ?? e.sessionID,
-      directory: typeof e.directory === "string" ? e.directory : undefined,
-    }
-  }
-  const props = e.properties ?? e.data ?? {}
-  const type = typeof e.type === "string" ? e.type : ""
-  return {
-    type,
-    props,
-    sessionID: props.sessionID ?? e.sessionID ?? e.data?.sessionID,
-    directory: e.directory ?? e.location?.directory,
-  }
-}
-
-async function directoryOf(ctx: any, norm: { sessionID?: string; directory?: string }): Promise<string | undefined> {
-  if (norm.directory) return norm.directory
-  const sessionID = norm.sessionID
-  if (typeof sessionID === "string" && sessionID) {
-    // Preferred: resolve the owning project directory from the session.
-    try {
-      if (ctx?.session?.get) {
-        const info = await ctx.session.get({ sessionID })
-        const dir = info?.location?.directory ?? info?.data?.location?.directory
-        if (typeof dir === "string" && dir) return dir
-      }
-    } catch {
-      // session may be gone; ignore
-    }
-    try {
-      if (ctx?.client?.session?.get) {
-        const info = await ctx.client.session.get(sessionID)
-        const dir = (info as any)?.data?.location?.directory ?? (info as any)?.location?.directory
-        if (typeof dir === "string" && dir) return dir
-      }
-    } catch {
-      // ignore
-    }
-  }
-  // Last resort: the directory this plugin instance loaded for.
-  const fallback = ctx?.directory ?? ctx?.project?.worktree ?? ctx?.location?.directory
-  return typeof fallback === "string" && fallback ? fallback : undefined
-}
-
-function shortProps(props: any): string {
-  const bits: string[] = []
-  if (typeof props?.permission === "string") bits.push(props.permission)
-  if (typeof props?.tool === "string") bits.push(props.tool)
-  else if (typeof props?.tool?.name === "string") bits.push(props.tool.name)
-  if (typeof props?.status === "string") bits.push(props.status)
-  else if (props?.status?.type) bits.push(String(props.status.type))
-  if (typeof props?.error === "string") bits.push(props.error)
-  else if (props?.error?.message) bits.push(String(props.error.message))
-  if (typeof props?.finish === "string") bits.push(props.finish)
-  const qs = props?.questions
-  if (Array.isArray(qs) && qs.length && typeof qs[0]?.header === "string") bits.push(qs[0].header)
-  else if (Array.isArray(qs) && qs.length && typeof qs[0]?.question === "string") bits.push(String(qs[0].question).slice(0, 40))
-  return bits.join(" ").slice(0, 80)
-}
-
-// Legacy (pre-V2-service) event names some servers still emit. Kept as a
-// fallback so status keeps working across opencode versions; the V2 names
-// above are authoritative on v2.0.x.
-const LEGACY_WORKING = new Set([
-  "session.execution.started",
-  "session.step.started",
-  "session.tool.called",
-  "session.text.started",
-  "session.reasoning.started",
-  "session.shell.started",
-  "session.compaction.started",
-  "session.prompted",
-  "command.executed",
-  "session.next.prompted",
-])
-
-const LEGACY_IDLE = new Set([
-  "session.execution.succeeded",
-  "session.execution.interrupted",
-])
 
 export default Plugin.define({
   id: "tmux-status",
-  // Untyped ctx on purpose: the plugin tolerates several server/event
-  // envelope shapes across opencode versions (see normalize/directoryOf).
-  async setup(ctx: any) {
-    const { socket, prefix } = optsOf(ctx)
+  async setup(ctx) {
+    const o = ctx.options;
+    const socket = nonempty(o.socket) || "opencode-popup";
+    const prefix = nonempty(o.prefix) || "oc_";
+    const controller = new AbortController();
+    const debug = o.debug === true;
+    const debugAt = new Map<string, number>();
+    const diagnostic = (key: string, message: string) => {
+      if (
+        !debug ||
+        controller.signal.aborted ||
+        Date.now() - (debugAt.get(key) ?? -Infinity) < 60_000
+      )
+        return;
+      debugAt.set(key, Date.now());
+      console.error(`[tmux-status] ${message}`);
+    };
+    const adapter = new Adapter(
+      socket,
+      prefix,
+      controller.signal,
+      diagnostic,
+      o.notifier === "notify-send" || o.notifier === "omarchy"
+        ? o.notifier
+        : "auto",
+      {
+        normal:
+          o.normalUrgency === "low" || o.normalUrgency === "critical"
+            ? o.normalUrgency
+            : "normal",
+        attention:
+          o.attentionUrgency === "low" || o.attentionUrgency === "normal"
+            ? o.attentionUrgency
+            : "critical",
+      },
+    );
+    const machine = new StateMachine();
+    const notifications = new NotificationPolicy(
+      typeof o.notificationCooldownMs === "number" &&
+        Number.isFinite(o.notificationCooldownMs) &&
+        o.notificationCooldownMs >= 0
+        ? o.notificationCooldownMs
+        : 120_000,
+      typeof o.changedDetailFloorMs === "number" &&
+        Number.isFinite(o.changedDetailFloorMs) &&
+        o.changedDetailFloorMs >= 0
+        ? o.changedDetailFloorMs
+        : 15_000,
+    );
+    const directories = new Map<string, string>();
+    let queue: Promise<void> = Promise.resolve();
 
-    const set = async (rawEvent: any, state: State, detail: string) => {
-      const norm = normalize(rawEvent)
-      const dir = await directoryOf(ctx, norm)
-      if (!dir) return
-      const session = tmuxSessionFor(prefix, dir)
-      if (!session) return
-      stamp(socket, session, state, detail || state)
-      notify(state, dir, detail || state)
-      lastStateByDir.set(dir, state)
+    const enqueue = (event: Decoded) => {
+      // Both hooks and the one subscription enter the same FIFO before any
+      // directory lookup, hash or subprocess can yield and reorder them.
+      queue = queue
+        .then(async () => {
+          if (controller.signal.aborted) return;
+          if (!event.transition || !event.sessionID) {
+            diagnostic(
+              "malformed",
+              `ignored malformed ${event.type || "event"}`,
+            );
+            return;
+          }
+          const dir = await resolveDirectory(
+            event,
+            directories,
+            ctx.session,
+            controller.signal,
+          );
+          if (controller.signal.aborted) return;
+          if (!dir) {
+            diagnostic("directory", "unresolved session directory");
+            return;
+          }
+          const before = machine.project.get(dir);
+          const next = machine.apply(
+            dir,
+            event.sessionID,
+            event.transition,
+            Date.now(),
+          );
+          if (!next) {
+            diagnostic(
+              "transition",
+              `ignored stale/invalid ${event.type || "event"}`,
+            );
+            return;
+          }
+          const detail = clean(next.detail, 120);
+          await adapter.stamp(
+            dir,
+            next.state,
+            next.since,
+            detail,
+            before?.state !== next.state,
+          );
+          if (controller.signal.aborted || o.notifications === false) return;
+          if (!notifications.eligible(dir, next.state, detail, Date.now()))
+            return;
+          if (
+            next.state !== "waiting" &&
+            next.state !== "done" &&
+            next.state !== "error"
+          )
+            return;
+          if (
+            await adapter.notify(
+              dir,
+              next.state,
+              o.notificationDetail === "state" ? next.state : detail,
+            )
+          )
+            notifications.record(dir, next.state, detail, Date.now());
+        })
+        .catch(() => diagnostic("event", "state update failed"));
     };
 
-    // Synchronous hooks: instant signal, no event-stream delay.
+    const hookTransition = (sessionID: string, transition: Transition) =>
+      enqueue({ sessionID, transition, type: `hook.${transition.signal}` });
+    const registrations: Array<{ dispose(): Promise<void> }> = [];
     try {
-      await ctx.tool.hook("execute.before", (event: any) => {
-        const tool = event?.tool ?? normalize(event).props?.tool
-        void set(event, "working", `tool ${String(tool ?? "?")}`)
-      })
+      registrations.push(
+        await ctx.session.hook("prompt", (event) => {
+          // Queue admission does not mean the agent has started executing.
+          if (event.delivery !== "queue")
+            hookTransition(event.sessionID, {
+              signal: "start",
+              detail: "prompt sent",
+            });
+        }),
+      );
+      registrations.push(
+        await ctx.tool.hook("execute.before", (event) => {
+          hookTransition(event.sessionID, {
+            signal: "activity",
+            detail: `tool ${event.tool}`,
+          });
+        }),
+      );
     } catch {
-      // older server without tool hooks — events below still cover status
+      diagnostic("hooks", "hook registration failed");
     }
-    try {
-      await ctx.session.hook("prompt", (event: any) => {
-        void set(event, "working", "prompt sent")
-      })
-    } catch {
-      // ignore
-    }
-
-    const onEvent = async (rawEvent: any) => {
+    const subscription = (async () => {
       try {
-        const { type, props } = normalize(rawEvent)
-        // Input requests outrank everything: a blocked run keeps reporting
-        // "running" server-side, so waiting must win over working.
-        if (type === "permission.asked") {
-          await set(rawEvent, "waiting", `permission ${shortProps(props) || "approval needed"}`)
-        } else if (type === "question.asked") {
-          await set(rawEvent, "waiting", shortProps(props) || "input needed")
-        } else if (
-          type === "permission.replied" ||
-          type === "question.replied" ||
-          type === "question.rejected"
-        ) {
-          await set(rawEvent, "working", "approved — resuming")
-        } else if (type === "session.error" || type === "session.next.step.failed") {
-          await set(rawEvent, "error", shortProps(props) || "run failed")
-        } else if (type === "session.idle") {
-          // Authoritative turn end. `done` (not `idle`) so completion stays
-          // visible until the user returns (ack.sh demotes done -> idle).
-          await set(rawEvent, "done", "done — your move")
-        } else if (type === "session.status") {
-          const st = props?.status?.type ?? (rawEvent as any)?.data?.status?.type
-          if (st === "busy") await set(rawEvent, "working", shortProps(props) || "working")
-          else if (st === "idle") await set(rawEvent, "done", "done — your move")
-          // "retry" keeps previous state; a start/idle event follows shortly
-        } else if (type === "session.created") {
-          await set(rawEvent, "idle", "ready")
-        } else if (type === "session.next.step.started") {
-          const agent = typeof props?.agent === "string" && props.agent ? ` ${props.agent}` : ""
-          await set(rawEvent, "working", `step${agent}`.trim() || "working")
-        } else if (
-          type === "session.next.text.started" ||
-          type === "session.next.tool.called" ||
-          type === "session.next.shell.started" ||
-          type === "session.next.reasoning.started"
-        ) {
-          await set(rawEvent, "working", shortProps(props) || "working")
-        } else if (LEGACY_WORKING.has(type)) {
-          await set(rawEvent, "working", shortProps(props) || "working")
-        } else if (LEGACY_IDLE.has(type)) {
-          await set(rawEvent, "done", shortProps(props) || "done")
+        for await (const raw of ctx.event.subscribe({
+          signal: controller.signal,
+        })) {
+          const event = decode(raw);
+          if (event.transition) enqueue(event);
         }
-        // NOTE: session.next.step.ended is deliberately NOT a completion
-        // signal — steps end between tool calls while the run continues.
-        // Completion comes from session.idle / session.status idle.
       } catch {
-        // one bad event must not kill the loop
+        if (!controller.signal.aborted)
+          diagnostic("subscription", "event subscription failed");
       }
-    }
+    })();
 
-    // Event stream. V2 exposes typed per-event subscriptions; older servers
-    // expose a single async-iterable subscribe(). Try per-type first (precise,
-    // version-proof), fall back to the shared stream.
-    const wanted = [
-      "permission.asked",
-      "permission.replied",
-      "question.asked",
-      "question.replied",
-      "question.rejected",
-      "session.error",
-      "session.next.step.failed",
-      "session.idle",
-      "session.status",
-      "session.created",
-      "session.next.step.started",
-      "session.next.text.started",
-      "session.next.tool.called",
-      "session.next.shell.started",
-      "session.next.reasoning.started",
-    ]
-    const controllers: AbortController[] = []
-    let perTypeOk = false
-    try {
-      for (const t of wanted) {
-        const c = new AbortController()
-        const stream = ctx.event.subscribe(t, { signal: c.signal })
-        if (stream && typeof stream[Symbol.asyncIterator] === "function") {
-          perTypeOk = true
-          controllers.push(c)
-          void (async () => {
-            try {
-              for await (const ev of stream) await onEvent(ev)
-            } catch {
-              // aborted on unload
-            }
-          })()
-        } else {
-          c.abort()
-        }
-      }
-    } catch {
-      for (const c of controllers) c.abort()
-      controllers.length = 0
-      perTypeOk = false
-    }
-    if (!perTypeOk) {
-      const controller = new AbortController()
-      controllers.push(controller)
-      void (async () => {
-        try {
-          for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-            await onEvent(event)
-          }
-        } catch {
-          // aborted on unload
-        }
-      })()
-    }
-
-    return () => {
-      for (const c of controllers) c.abort()
-    }
+    return async () => {
+      controller.abort();
+      await Promise.allSettled(
+        registrations.map((registration) => registration.dispose()),
+      );
+      await subscription;
+      await queue;
+    };
   },
-})
+});

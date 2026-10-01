@@ -5,7 +5,7 @@
     "moduleResolution": "bundler",
     "strict": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": ["node", "bun-types"]
   },
-  "include": ["src"]
+  "include": ["src", "tests"]
 }
