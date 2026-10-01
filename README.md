@@ -1,4 +1,6 @@
-# opencode-tmux-status
+# opencode-tmux-session-status
+
+[GitHub](https://github.com/4m1z/opencode-tmux-session-status) · [npm](https://www.npmjs.com/package/opencode-tmux-session-status)
 
 OpenCode server plugin that stamps the owning tmux session with
 `@opencode_state` / `@opencode_state_at` / `@opencode_detail`, so a picker or
@@ -22,31 +24,31 @@ worktree directory intentionally hashes to a different tmux session.
 **From npm:**
 
 ```sh
-opencode plugin add opencode-tmux-status@latest
+opencode plugin add opencode-tmux-session-status@latest
 ```
 
 **From git or local checkout:**
 
 ```sh
-opencode plugin add github:4m1z/opencode-tmux-status
+opencode plugin add github:4m1z/opencode-tmux-session-status
 # or pin a ref:
-opencode plugin add github:4m1z/opencode-tmux-status#main
+opencode plugin add github:4m1z/opencode-tmux-session-status#main
 ```
 
 Or declare it in config (`opencode.json` / `opencode.jsonc`):
 
 ```jsonc
 {
-  "plugins": ["opencode-tmux-status@latest"],
-  // "plugins": ["opencode-tmux-status@0.1.0"]
-  // "plugins": ["github:4m1z/opencode-tmux-status"]
-  // "plugins": ["./path/to/opencode-tmux-status"] // no build needed, loads from src/
+  "plugins": ["opencode-tmux-session-status@latest"],
+  // "plugins": ["opencode-tmux-session-status@0.1.1"]
+  // "plugins": ["github:4m1z/opencode-tmux-session-status"]
+  // "plugins": ["./path/to/opencode-tmux-session-status"] // no build needed, loads from src/
 }
 ```
 
 Requires `tmux` and `cksum` on `PATH`. Notifications are best-effort:
 `omarchy notification send`, falling back to `notify-send`. Missing
-socket/session never breaks the run — the picker falls back to the API.
+socket/session never breaks the run; the picker falls back to the API.
 
 ## Options
 
@@ -54,7 +56,7 @@ socket/session never breaks the run — the picker falls back to the API.
 {
   "plugins": [
     {
-      "package": "opencode-tmux-status@latest",
+      "package": "opencode-tmux-session-status@latest",
       "options": {
         "socket": "opencode-popup", // tmux server socket (-L)
         "prefix": "oc_", // session name prefix before the cksum hash
@@ -82,7 +84,7 @@ socket/session never breaks the run — the picker falls back to the API.
 | `error`   | run failed / session errored (stays until next task starts) |
 | `idle`    | no work outstanding, acknowledged                           |
 
-Completion is never inferred from silence — only explicit idle/error events
+Completion is never inferred from silence; only explicit idle/error events
 produce `done` / `error`.
 
 The project stamp belongs to one **foreground session ID** at a time: a new
