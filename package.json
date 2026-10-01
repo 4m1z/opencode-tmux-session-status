@@ -1,6 +1,6 @@
 {
-  "name": "opencode-tmux-status",
-  "version": "0.1.1",
+  "name": "opencode-tmux-session-status",
+  "version": "0.1.0",
   "description": "Report opencode session status to tmux (working / waiting / done / error / idle) plus desktop notifications",
   "license": "MIT",
   "repository": {
