@@ -299,7 +299,7 @@ test("hook lookup and stream events stay ordered; cleanup aborts stream and disp
     event: {
       subscribe: ({ signal }: { signal: AbortSignal }) => stream(signal),
     },
-    location: { directory: "/wrong-project" },
+    location: { directory: project },
   } as unknown as Parameters<typeof plugin.setup>[0];
   execFileSync("tmux", ["-L", socket, "new-session", "-d", "-s", name]);
   try {

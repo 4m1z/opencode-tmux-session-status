@@ -82,6 +82,8 @@ export default Plugin.define({
         : 15_000,
     );
     const directories = new Map<string, string>();
+    const parents = new Map<string, string | undefined>();
+    const runningChildren = new Map<string, Set<string>>();
     let queue: Promise<void> = Promise.resolve();
 
     const enqueue = (event: Decoded) => {
@@ -108,13 +110,54 @@ export default Plugin.define({
             diagnostic("directory", "unresolved session directory");
             return;
           }
+          // Each location loads this plugin, but the event stream is server-wide.
+          if (dir !== ctx.location.directory) return;
+          let rootID = event.sessionID;
+          for (;;) {
+            if (!parents.has(rootID)) {
+              const info = await ctx.session.get(
+                { sessionID: rootID },
+                { signal: controller.signal },
+              );
+              parents.set(rootID, info.parentID);
+            }
+            const parentID = parents.get(rootID);
+            if (!parentID) break;
+            rootID = parentID;
+          }
+          if (controller.signal.aborted) return;
+          // Child input blocks the main task; child lifecycle events do not finish it.
+          if (rootID !== event.sessionID) {
+            const signal = event.transition.signal;
+            if (signal === "start") {
+              const running = runningChildren.get(rootID) ?? new Set<string>();
+              running.add(event.sessionID);
+              runningChildren.set(rootID, running);
+            } else if (
+              signal === "finish" ||
+              signal === "interrupt" ||
+              (signal === "fail" && !event.type?.endsWith(".step.failed"))
+            ) {
+              runningChildren.get(rootID)?.delete(event.sessionID);
+            }
+            if (
+              !["ask", "approve", "deny", "answer", "reject"].includes(signal)
+            )
+              return;
+          } else if (
+            event.transition.signal === "finish" &&
+            runningChildren.get(rootID)?.size
+          ) {
+            // Background child completion resumes the parent for its final answer.
+            return;
+          }
+          // A canceled child question is not a failure of the main task.
+          const transition: Transition =
+            rootID !== event.sessionID && event.transition.signal === "reject"
+              ? { ...event.transition, signal: "answer" }
+              : event.transition;
           const before = machine.project.get(dir);
-          const next = machine.apply(
-            dir,
-            event.sessionID,
-            event.transition,
-            Date.now(),
-          );
+          const next = machine.apply(dir, rootID, transition, Date.now());
           if (!next) {
             diagnostic(
               "transition",

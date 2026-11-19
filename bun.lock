@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "opencode-tmux-status",
+      "name": "opencode-tmux-session-status",
       "dependencies": {
         "@opencode/plugin": "latest",
       },

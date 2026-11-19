@@ -69,6 +69,13 @@ take over until execution starts. `done` persists until the companion
 manager's `ack.sh` changes it to `idle`; `error` persists until new work starts.
 `@opencode_state_at` records when the state was entered, not a heartbeat.
 
+Each plugin instance handles only its own location's events, so loading
+multiple projects does not duplicate desktop notifications. Subagents do not
+take over the main session's status or send completion alerts. Their
+permission and question requests still set the main task to `waiting`.
+Completion waits for running children and the parent's final response;
+canceling a child question does not mark the main task as failed.
+
 ## License
 
 MIT
